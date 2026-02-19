@@ -6,11 +6,11 @@ from config import SET_LOG_CHANNEL
 
 class SetModal(discord.ui.Modal, title="Solicitar SET"):
     nome = discord.ui.TextInput(label="Seu nome in-game", required=True, max_length=20)
-    id = discord.ui.TextInput(label="Seu ID", required=True, max_length=10)
+    player_id = discord.ui.TextInput(label="Seu ID", required=True, max_length=10)
 
     async def on_submit(self, interaction: discord.Interaction):
-        membro = interaction.user
         guild = interaction.guild
+        membro = interaction.user
 
         if guild is None:
             return await interaction.response.send_message(
@@ -18,31 +18,42 @@ class SetModal(discord.ui.Modal, title="Solicitar SET"):
                 ephemeral=True
             )
 
-        if not self.id.value.isdigit():
+        # pega o "Member" do bot de forma confiável
+        bot_member = guild.me
+        if bot_member is None and interaction.client.user is not None:
+            bot_member = guild.get_member(interaction.client.user.id)
+
+        if bot_member is None:
+            return await interaction.response.send_message(
+                "❌ Não consegui identificar o bot no servidor (guild.me).",
+                ephemeral=True
+            )
+
+        # valida ID
+        if not self.player_id.value.isdigit():
             return await interaction.response.send_message(
                 "❌ O ID deve conter apenas números.",
                 ephemeral=True
             )
 
-        novo_nick = f"{self.nome.value} | {self.id.value}"
+        novo_nick = f"{self.nome.value} | {self.player_id.value}"
 
-        me = guild.me
-        if me is None:
+        # permissão
+        if not bot_member.guild_permissions.manage_nicknames:
             return await interaction.response.send_message(
-                "❌ Não consegui identificar o bot no servidor.",
+                "❌ Eu não tenho a permissão **Manage Nicknames**.\n"
+                "➡️ Vá em *Server Settings → Roles → (cargo do bot) → Permissions* e habilite.",
                 ephemeral=True
             )
 
-        if not me.guild_permissions.manage_nicknames:
-            return await interaction.response.send_message(
-                "❌ Eu não tenho permissão **Manage Nicknames** (Gerenciar apelidos).",
-                ephemeral=True
-            )
-
-        if membro.top_role >= me.top_role and guild.owner_id != membro.id:
+        # hierarquia de cargos (bot precisa estar acima do usuário)
+        # OBS: dono do servidor sempre pode tudo, mas o bot ainda respeita hierarquia
+        if membro.top_role >= bot_member.top_role and guild.owner_id != membro.id:
             return await interaction.response.send_message(
                 "❌ Não consigo alterar seu apelido por causa da **hierarquia de cargos**.\n"
-                "➡️ Suba o cargo do bot acima do seu cargo no servidor.",
+                f"➡️ Seu cargo: **{membro.top_role.name}**\n"
+                f"➡️ Cargo do bot: **{bot_member.top_role.name}**\n\n"
+                "✅ Solução: coloque o **cargo do bot acima** do seu cargo em *Server Settings → Roles*.",
                 ephemeral=True
             )
 
@@ -50,16 +61,17 @@ class SetModal(discord.ui.Modal, title="Solicitar SET"):
             await membro.edit(nick=novo_nick, reason="SET solicitado via bot")
         except discord.Forbidden:
             return await interaction.response.send_message(
-                "❌ Discord negou a alteração do nickname.\n"
-                "Verifique **Manage Nicknames** e a **hierarquia de cargos**.",
+                "❌ O Discord bloqueou a alteração do nickname.\n"
+                "➡️ Confira: permissão **Manage Nicknames** + hierarquia de cargos.",
                 ephemeral=True
             )
         except discord.HTTPException as e:
             return await interaction.response.send_message(
-                f"❌ Discord recusou a alteração do nickname. Detalhe: `{e}`",
+                f"❌ Erro do Discord ao alterar o nickname: `{e}`",
                 ephemeral=True
             )
 
+        # log
         log_channel = discord.utils.get(guild.text_channels, name=SET_LOG_CHANNEL)
         if log_channel:
             await log_channel.send(
@@ -76,13 +88,17 @@ class SetView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Solicitar SET", style=discord.ButtonStyle.blurple, custom_id="set_button")
+    @discord.ui.button(
+        label="Solicitar SET",
+        style=discord.ButtonStyle.blurple,
+        custom_id="set_button"
+    )
     async def button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(SetModal())
 
 
 class SetSystem(commands.Cog):
-    def __init__(self, bot):
+    def __init__(self, bot: commands.Bot):
         self.bot = bot
         bot.add_view(SetView())
 
@@ -97,5 +113,5 @@ class SetSystem(commands.Cog):
         await interaction.response.send_message(embed=embed, view=SetView())
 
 
-async def setup(bot):
+async def setup(bot: commands.Bot):
     await bot.add_cog(SetSystem(bot))

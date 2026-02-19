@@ -1,0 +1,9 @@
+# ambiente virtual / cache
+.venv/
+__pycache__/
+*.pyc
+
+# segredos
+.env
+.env.*
+config.py
