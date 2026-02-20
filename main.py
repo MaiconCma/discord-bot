@@ -1,5 +1,6 @@
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(override=True)
+
 import os
 import sys
 import discord
@@ -25,7 +26,7 @@ class Bot(commands.Bot):
 
         guild = discord.Object(id=GUILD_ID)
 
-        # ✅ Registra comandos apenas na guild (sem global)
+        # Comandos de slash só na guild (evita duplicar global)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
 
@@ -42,8 +43,11 @@ async def on_ready():
 
 async def main():
     token = os.getenv("TOKEN")
+    print("[DEBUG] TOKEN len =", len(token or ""))
+
     if not token:
-        raise RuntimeError("TOKEN não encontrado em variável de ambiente.")
+        raise RuntimeError("TOKEN não encontrado em variável de ambiente (.env).")
+
     async with bot:
         await bot.start(token)
 
