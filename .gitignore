@@ -1,18 +1,8 @@
-# Ambiente virtual
-.venv/
-venv/
-
-# Cache do Python
 __pycache__/
+.cache/
+.venv/
 *.pyc
-*.pyo
-*.pyd
 
-# Variáveis/segredos (NUNCA subir)
 .env
 .env.*
 config.py
-
-# Logs e caches diversos
-*.log
-.cache/
