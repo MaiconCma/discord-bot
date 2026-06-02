@@ -3,7 +3,6 @@ from discord.ext import commands
 from discord import app_commands
 from config import CATEGORIA_NOME, LOG_CHANNEL_NAME, CARGOS_PERMITIDOS_IDS
 
-
 class BauModal(discord.ui.Modal, title="Criar Baú"):
     numero = discord.ui.TextInput(label="Número do seu baú", required=True)
 
@@ -30,6 +29,7 @@ class BauModal(discord.ui.Modal, title="Criar Baú"):
                 ephemeral=True
             )
 
+        # Verifica se já existe um canal com o tópico igual ao ID do usuário
         for canal in categoria.text_channels:
             if canal.topic == str(membro.id):
                 return await interaction.response.send_message(
@@ -49,12 +49,18 @@ class BauModal(discord.ui.Modal, title="Criar Baú"):
             if cargo:
                 overwrites[cargo] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
 
-        novo_canal = await guild.create_text_channel(
-            name=nome_canal,
-            category=categoria,
-            overwrites=overwrites,
-            topic=str(membro.id)
-        )
+        try:
+            novo_canal = await guild.create_text_channel(
+                name=nome_canal,
+                category=categoria,
+                overwrites=overwrites,
+                topic=str(membro.id)
+            )
+        except discord.Forbidden:
+            return await interaction.response.send_message(
+                "❌ O bot não tem permissão para criar canais.",
+                ephemeral=True
+            )
 
         log_channel = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
         if log_channel:
@@ -67,7 +73,6 @@ class BauModal(discord.ui.Modal, title="Criar Baú"):
             ephemeral=True
         )
 
-
 class BauView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -79,7 +84,6 @@ class BauView(discord.ui.View):
     )
     async def button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(BauModal())
-
 
 class BauSystem(commands.Cog):
     def __init__(self, bot):
@@ -95,7 +99,6 @@ class BauSystem(commands.Cog):
             color=discord.Color.green()
         )
         await interaction.response.send_message(embed=embed, view=BauView())
-
 
 async def setup(bot):
     await bot.add_cog(BauSystem(bot))

@@ -4,7 +4,6 @@ import csv
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 import discord
 from discord.ext import commands
@@ -12,16 +11,19 @@ from discord import app_commands
 
 import config
 
-# Integração com economia (opcional)
 try:
     from cogs.economia_system import credit_caixa_on_sale
 except Exception:
-    credit_caixa_on_sale = None  # type: ignore
+    credit_caixa_on_sale = None
+
+# Lock para escrita segura no CSV
+_csv_lock = asyncio.Lock()
 
 
 def _has_any_role(member: discord.Member, role_ids: list[int]) -> bool:
     if member.guild_permissions.administrator:
         return True
+
     ids = {r.id for r in member.roles}
     return any(rid in ids for rid in role_ids)
 
@@ -35,33 +37,22 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _items() -> dict[str, dict[str, Any]]:
-    items = getattr(config, "VENDAS_ITENS", {}) or {}
-    return dict(items)
+def _get_produtos() -> dict[str, dict[str, int | str]]:
+    """
+    Produtos virtuais/in-game do RP.
+    """
+    return getattr(config, "VENDAS_ARMAS_PRECOS", {
+        "ia2": {"nome": "IA2", "preco": 130000},
+        "mtar": {"nome": "MTAR", "preco": 70000},
+        "five_familia": {"nome": "Five - Família", "preco": 30000},
+        "five_pista": {"nome": "Five - Pista", "preco": 40000},
+    })
 
 
-def _get_item_names() -> list[str]:
-    return list(_items().keys())
-
-
-def _get_price(item_name: str, tipo: str) -> int:
-    it = _items().get(item_name, {})
-    if "preco" in it:
-        return int(it.get("preco", 0))
-    if tipo == "familia":
-        return int(it.get("preco_familia", 0))
-    return int(it.get("preco_pista", 0))
-
-
-def _get_emoji(item_name: str) -> str:
-    it = _items().get(item_name, {})
-    return str(it.get("emoji", "🔫"))
-
-
-async def _ensure_category_and_channels(guild: discord.Guild) -> tuple[discord.CategoryChannel, discord.TextChannel, discord.TextChannel]:
-    cat_name = getattr(config, "VENDAS_CATEGORIA_NOME", "💰 - VENDAS")
-    channel_name = getattr(config, "VENDAS_CHANNEL_NAME", "💰-vendas")
-    log_name = getattr(config, "VENDAS_LOG_CHANNEL_NAME", "📋-logs-vendas")
+async def _ensure_category_and_channels(guild: discord.Guild):
+    cat_name = getattr(config, "VENDAS_ARMAS_CATEGORIA_NOME", "💰 - VENDAS")
+    channel_name = getattr(config, "VENDAS_ARMAS_CHANNEL_NAME", "💰-vendas-armas")
+    log_name = getattr(config, "VENDAS_ARMAS_LOG_CHANNEL_NAME", "📋-logs-vendas-armas")
 
     category = discord.utils.get(guild.categories, name=cat_name)
     if not category:
@@ -79,26 +70,16 @@ async def _ensure_category_and_channels(guild: discord.Guild) -> tuple[discord.C
 
 
 def _csv_path() -> Path:
-    return Path(getattr(config, "VENDAS_EXPORT_CSV_PATH", "data/vendas.csv"))
+    return Path(getattr(config, "VENDAS_ARMAS_EXPORT_CSV_PATH", "data/vendas_armas.csv"))
 
 
-def _append_csv(row: dict[str, str]) -> None:
-    path = _csv_path()
+def _write_csv_sync(path: Path, row: dict[str, str]):
+    # Isolamento da operação de disco para rodar em thread separada
     path.parent.mkdir(parents=True, exist_ok=True)
-
     header = [
-        "timestamp_utc",
-        "guild_id",
-        "canal_id",
-        "tipo",
-        "arma",
-        "quantidade",
-        "preco_unit",
-        "total",
-        "player",
-        "registrado_por_id",
+        "timestamp_utc", "guild_id", "canal_id", "item", "quantidade", 
+        "preco_unit", "total", "player", "registrado_por_id"
     ]
-
     file_exists = path.exists()
     with open(path, "a", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=header)
@@ -107,228 +88,255 @@ def _append_csv(row: dict[str, str]) -> None:
         w.writerow({k: row.get(k, "") for k in header})
 
 
-def _read_last_rows(limit: int = 20) -> list[dict[str, str]]:
-    path = _csv_path()
-    if not path.exists():
-        return []
-    with open(path, "r", encoding="utf-8", newline="") as f:
-        r = list(csv.DictReader(f))
-    return r[-limit:]
+async def _append_csv(row: dict[str, str]) -> None:
+    async with _csv_lock:
+        path = _csv_path()
+        await asyncio.to_thread(_write_csv_sync, path, row)
 
 
 def _build_panel_embed() -> discord.Embed:
+    produtos = _get_produtos()
+
+    linhas = []
+    for produto in produtos.values():
+        nome = str(produto["nome"])
+        preco = int(produto["preco"])
+        linhas.append(f"• **{nome}:** {_money(preco)}")
+
     emb = discord.Embed(
-        title="💰 Painel de Vendas",
+        title="🔫 Sistema de Vendas - Armas RP",
         description=(
-            "**Passo a passo**\n"
-            "1) Família / Pista\n"
-            "2) Arma\n"
-            "3) Quantidade + Player\n\n"
-            "✅ Cada venda vira **uma linha** no canal de vendas."
+            "**Tabela de preços:**\n"
+            f"{chr(10).join(linhas)}\n\n"
+            "Clique no botão do item vendido para registrar a venda.\n"
+            "Você informará a **quantidade** e o **ID do player**."
         ),
+        color=discord.Color.dark_gold(),
     )
-    emb.set_footer(text="Use /exportvendas para baixar o CSV (e XLSX, se habilitado)")
+    emb.set_footer(text="Use /exportvendas para baixar a planilha")
     return emb
 
 
-class VendaStep1View(discord.ui.View):
-    def __init__(self, cog: "VendasSystem"):
-        super().__init__(timeout=None)
+class VendaArmaModal(discord.ui.Modal):
+    quantidade = discord.ui.TextInput(
+        label="Quantidade",
+        placeholder="Ex: 1",
+        min_length=1,
+        max_length=6,
+    )
+    player_id = discord.ui.TextInput(
+        label="ID do Player",
+        placeholder="Ex: 12345",
+        max_length=80,
+    )
+
+    def __init__(self, cog: "VendasSystem", item_nome: str, preco_unit: int):
+        super().__init__(title=f"Registrar venda - {item_nome}", timeout=None)
         self.cog = cog
-
-    @discord.ui.button(label="Família", style=discord.ButtonStyle.primary, custom_id="vendas:step1:familia")
-    async def familia(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self.cog._step2(interaction, "familia")
-
-    @discord.ui.button(label="Pista", style=discord.ButtonStyle.danger, custom_id="vendas:step1:pista")
-    async def pista(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self.cog._step2(interaction, "pista")
-
-
-class VendaStep2View(discord.ui.View):
-    def __init__(self, cog: "VendasSystem", tipo: str):
-        super().__init__(timeout=None)
-        self.cog = cog
-        self.tipo = tipo
-
-        options = [
-            discord.SelectOption(label=f"{_get_emoji(name)} {name}", value=name)
-            for name in _get_item_names()
-        ]
-        if not options:
-            options = [discord.SelectOption(label="(Configure VENDAS_ITENS no config.py)", value="__none__")]
-
-        self.select = discord.ui.Select(
-            placeholder="Escolha a arma",
-            min_values=1,
-            max_values=1,
-            options=options,
-            custom_id=f"vendas:step2:arma:{tipo}",
-        )
-        self.select.callback = self._on_select
-        self.add_item(self.select)
-
-    async def _on_select(self, interaction: discord.Interaction):
-        arma = self.select.values[0]
-        if arma == "__none__":
-            return await interaction.response.send_message("❌ Configure `VENDAS_ITENS` no `config.py`.", ephemeral=True)
-
-        modal = VendaStep3Modal(self.cog, tipo=self.tipo, arma=arma)
-        await interaction.response.send_modal(modal)
-
-
-class VendaStep3Modal(discord.ui.Modal, title="Registrar venda"):
-    player = discord.ui.TextInput(label="ID DO PLAYER", placeholder="Ex: 12345", max_length=80)
-    quantidade = discord.ui.TextInput(label="Quantidade Vendida", placeholder="Ex: 1", max_length=6)
-
-    def __init__(self, cog: "VendasSystem", tipo: str, arma: str):
-        super().__init__(timeout=None, custom_id=f"vendas:step3:{tipo}:{arma}")
-        self.cog = cog
-        self.tipo = tipo
-        self.arma = arma
+        self.item_nome = item_nome
+        self.preco_unit = preco_unit
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
-            qtd = int(str(self.quantidade.value).strip())
+            qtd = int(self.quantidade.value.strip())
             if qtd <= 0:
-                raise ValueError()
-        except Exception:
-            return await interaction.response.send_message("❌ Quantidade inválida. Use um número inteiro > 0.", ephemeral=True)
+                raise ValueError
+        except ValueError:
+            return await interaction.response.send_message(
+                "❌ Quantidade inválida. Use um número inteiro positivo.",
+                ephemeral=True,
+            )
 
-        await self.cog._registrar(
-            interaction,
-            tipo=self.tipo,
-            arma=self.arma,
-            qtd=qtd,
-            player=str(self.player.value).strip(),
-        )
+        player = self.player_id.value.strip()
+        if not player:
+            return await interaction.response.send_message(
+                "❌ Você precisa informar o ID do player.",
+                ephemeral=True,
+            )
 
-
-class VendasSystem(commands.Cog):
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-        self.export_lock = asyncio.Lock()
-        self.allowed_roles = list(getattr(config, "VENDAS_CARGOS_PERMITIDOS_IDS", [])) or list(getattr(config, "CARGOS_PERMITIDOS_IDS", []))
-
-        # view persistente
-        bot.add_view(VendaStep1View(self))
-
-    def _check_perm(self, interaction: discord.Interaction) -> bool:
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            return False
-        return _has_any_role(interaction.user, self.allowed_roles)
-
-    async def _step2(self, interaction: discord.Interaction, tipo: str) -> None:
-        if not self._check_perm(interaction):
-            return await interaction.response.send_message("❌ Você não tem permissão para registrar vendas.", ephemeral=True)
-
-        emb = discord.Embed(
-            title="💰 Registrar venda",
-            description=f"**1) Tipo:** `{tipo}`\n\nAgora selecione a arma (Passo 2).",
-        )
-        await interaction.response.edit_message(embed=emb, view=VendaStep2View(self, tipo))
-
-    async def _registrar(self, interaction: discord.Interaction, tipo: str, arma: str, qtd: int, player: str) -> None:
-        if not self._check_perm(interaction):
-            return await interaction.response.send_message("❌ Você não tem permissão para registrar vendas.", ephemeral=True)
         if not interaction.guild:
-            return await interaction.response.send_message("❌ Sem guild.", ephemeral=True)
+            return await interaction.response.send_message("❌ Sem servidor.", ephemeral=True)
+
+        if not self.cog._check_perm(interaction):
+            return await interaction.response.send_message(
+                "❌ Você não tem permissão para registrar vendas.",
+                ephemeral=True,
+            )
+
+        total = qtd * self.preco_unit
 
         _, vendas_ch, log_ch = await _ensure_category_and_channels(interaction.guild)
 
-        unit = _get_price(arma, tipo)
-        total = unit * qtd
-        tipo_label = "Família" if tipo == "familia" else "Pista"
-
-        # Linha única no canal de vendas
         line = (
-            f" Tipo de Venda:  **[{tipo_label}]**{_get_emoji(arma)} \n| Tipo de arma: **{arma}** \n| Quantidade: x{qtd} \n| "
-            f"**Total: {_money(total)}** \n| ID do Player: `{player}` \n| Vendido por <@{interaction.user.id}>"
+            f"🔫 **Venda de Arma RP**\n"
+            f"└ Item: **{self.item_nome}**\n"
+            f"└ Quantidade: **x{qtd}**\n"
+            f"└ Preço unit.: **{_money(self.preco_unit)}**\n"
+            f"└ Total: **{_money(total)}**\n"
+            f"└ ID do Player: `{player}`\n"
+            f"└ Vendido por: {interaction.user.mention}"
         )
         await vendas_ch.send(line)
 
-        # Log detalhado
         emb = discord.Embed(title="📋 Venda registrada", color=discord.Color.green())
-        emb.add_field(name="Tipo", value=tipo_label, inline=True)
-        emb.add_field(name="Arma", value=arma, inline=True)
+        emb.add_field(name="Item", value=self.item_nome, inline=True)
         emb.add_field(name="Quantidade", value=str(qtd), inline=True)
-        emb.add_field(name="Preço unit.", value=_money(unit), inline=True)
+        emb.add_field(name="Preço unit.", value=_money(self.preco_unit), inline=True)
         emb.add_field(name="Total", value=_money(total), inline=True)
-        emb.add_field(name="Player", value=player or "-", inline=False)
+        emb.add_field(name="ID do Player", value=player, inline=False)
         emb.add_field(name="Registrado por", value=f"{interaction.user} ({interaction.user.id})", inline=False)
         emb.set_footer(text=_now_iso())
         await log_ch.send(embed=emb)
 
-        # CSV
-        _append_csv(
-            {
-                "timestamp_utc": _now_iso(),
-                "guild_id": str(interaction.guild.id),
-                "canal_id": str(vendas_ch.id),
-                "tipo": tipo,
-                "arma": arma,
-                "quantidade": str(qtd),
-                "preco_unit": str(unit),
-                "total": str(total),
-                "player": player,
-                "registrado_por_id": str(interaction.user.id),
-            }
-        )
+        await _append_csv({
+            "timestamp_utc": _now_iso(),
+            "guild_id": str(interaction.guild.id),
+            "canal_id": str(vendas_ch.id),
+            "item": self.item_nome,
+            "quantidade": str(qtd),
+            "preco_unit": str(self.preco_unit),
+            "total": str(total),
+            "player": player,
+            "registrado_por_id": str(interaction.user.id),
+        })
 
-        # ECONOMIA: adiciona no caixa automaticamente (se habilitado)
         if credit_caixa_on_sale is not None:
             try:
                 await credit_caixa_on_sale(interaction.guild.id, total, interaction.user.id)
             except Exception:
                 pass
 
-        # volta pro step1
-        await interaction.response.edit_message(embed=_build_panel_embed(), view=VendaStep1View(self))
-
-    # /painelvendas
-    @app_commands.command(name="painelvendas", description="Posta o painel de vendas (passo a passo).")
-    async def painelvendas(self, interaction: discord.Interaction):
-        if not self._check_perm(interaction):
-            return await interaction.response.send_message("❌ Você não tem permissão para usar isso.", ephemeral=True)
-        if not interaction.guild:
-            return await interaction.response.send_message("❌ Sem guild.", ephemeral=True)
-
-        _, vendas_ch, _ = await _ensure_category_and_channels(interaction.guild)
-
-        await interaction.channel.send(embed=_build_panel_embed(), view=VendaStep1View(self))
         await interaction.response.send_message(
-            f"✅ Painel enviado aqui. A lista de vendas continua em {vendas_ch.mention}.",
+            (
+                f"✅ Venda registrada: **x{qtd} {self.item_nome}** "
+                f"por **{_money(total)}** para `{player}`."
+            ),
             ephemeral=True,
         )
 
-    # /exportvendas
-    @app_commands.command(name="exportvendas", description="Exporta as vendas (CSV e XLSX se habilitado).")
+
+class VendaArmasView(discord.ui.View):
+    def __init__(self, cog: "VendasSystem"):
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    async def _abrir_modal(self, interaction: discord.Interaction, produto_key: str):
+        if not self.cog._check_perm(interaction):
+            return await interaction.response.send_message(
+                "❌ Você não tem permissão para registrar vendas.",
+                ephemeral=True,
+            )
+
+        produto = _get_produtos()[produto_key]
+        await interaction.response.send_modal(
+            VendaArmaModal(
+                self.cog,
+                item_nome=str(produto["nome"]),
+                preco_unit=int(produto["preco"]),
+            )
+        )
+
+    @discord.ui.button(
+        label="IA2 - R$ 130.000",
+        style=discord.ButtonStyle.danger,
+        custom_id="vendas_armas:ia2",
+    )
+    async def ia2(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await self._abrir_modal(interaction, "ia2")
+
+    @discord.ui.button(
+        label="MTAR - R$ 70.000",
+        style=discord.ButtonStyle.danger,
+        custom_id="vendas_armas:mtar",
+    )
+    async def mtar(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await self._abrir_modal(interaction, "mtar")
+
+    @discord.ui.button(
+        label="Five Família - R$ 30.000",
+        style=discord.ButtonStyle.primary,
+        custom_id="vendas_armas:five_familia",
+    )
+    async def five_familia(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await self._abrir_modal(interaction, "five_familia")
+
+    @discord.ui.button(
+        label="Five Pista - R$ 40.000",
+        style=discord.ButtonStyle.primary,
+        custom_id="vendas_armas:five_pista",
+    )
+    async def five_pista(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await self._abrir_modal(interaction, "five_pista")
+
+
+class VendasSystem(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self.export_lock = asyncio.Lock()
+
+        self.allowed_roles = (
+            list(getattr(config, "VENDAS_ARMAS_CARGOS_PERMITIDOS_IDS", []))
+            or list(getattr(config, "VENDAS_CARGOS_PERMITIDOS_IDS", []))
+            or list(getattr(config, "CARGOS_PERMITIDOS_IDS", []))
+        )
+
+        bot.add_view(VendaArmasView(self))
+
+    def _check_perm(self, interaction: discord.Interaction) -> bool:
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return False
+
+        return _has_any_role(interaction.user, self.allowed_roles)
+
+    @app_commands.command(name="painelvendas", description="Posta o painel de vendas de armas RP.")
+    async def painelvendas(self, interaction: discord.Interaction):
+        if not self._check_perm(interaction):
+            return await interaction.response.send_message(
+                "❌ Você não tem permissão para usar isso.",
+                ephemeral=True,
+            )
+
+        if not interaction.guild:
+            return await interaction.response.send_message("❌ Sem guild.", ephemeral=True)
+
+        if not interaction.channel:
+            return await interaction.response.send_message("❌ Canal inválido.", ephemeral=True)
+
+        await interaction.channel.send(embed=_build_panel_embed(), view=VendaArmasView(self))
+        await interaction.response.send_message("✅ Painel de vendas enviado neste canal.", ephemeral=True)
+
+    @app_commands.command(name="exportvendas", description="Exporta as vendas de armas RP.")
     async def exportvendas(self, interaction: discord.Interaction):
         if not self._check_perm(interaction):
-            return await interaction.response.send_message("❌ Você não tem permissão para exportar.", ephemeral=True)
+            return await interaction.response.send_message(
+                "❌ Você não tem permissão para exportar.",
+                ephemeral=True,
+            )
 
         async with self.export_lock:
             csv_path = _csv_path()
             if not csv_path.exists():
-                return await interaction.response.send_message("❌ Ainda não existe CSV (registre uma venda primeiro).", ephemeral=True)
+                return await interaction.response.send_message(
+                    "❌ Ainda não existe CSV. Registre uma venda primeiro.",
+                    ephemeral=True,
+                )
 
             await interaction.response.send_message("📤 Preparando arquivos...", ephemeral=True)
-
-            # CSV
             await interaction.followup.send(file=discord.File(str(csv_path)), ephemeral=True)
 
-            # XLSX (opcional)
-            if getattr(config, "VENDAS_EXPORT_XLSX", False):
+            if getattr(config, "VENDAS_ARMAS_EXPORT_XLSX", getattr(config, "VENDAS_EXPORT_XLSX", False)):
                 try:
-                    xlsx_path = Path(getattr(config, "VENDAS_EXPORT_XLSX_PATH", "data/vendas.xlsx"))
+                    xlsx_path = Path(getattr(config, "VENDAS_ARMAS_EXPORT_XLSX_PATH", "data/vendas_armas.xlsx"))
                     xlsx_path.parent.mkdir(parents=True, exist_ok=True)
                     self._csv_to_xlsx(csv_path, xlsx_path)
                     await interaction.followup.send(file=discord.File(str(xlsx_path)), ephemeral=True)
                 except Exception:
-                    await interaction.followup.send("⚠️ Não consegui gerar o XLSX. (veja o console / bot.log)", ephemeral=True)
+                    await interaction.followup.send(
+                        "⚠️ Não foi possível gerar o XLSX. Veja o console.",
+                        ephemeral=True,
+                    )
 
     def _csv_to_xlsx(self, csv_path: Path, xlsx_path: Path) -> None:
-        # Gera XLSX simples (sem depender de pandas)
         from openpyxl import Workbook
 
         with open(csv_path, "r", encoding="utf-8", newline="") as f:
@@ -336,33 +344,59 @@ class VendasSystem(commands.Cog):
 
         wb = Workbook()
         ws = wb.active
-        ws.title = "vendas"
+        ws.title = "vendas_armas"
+
         for r in rows:
             ws.append(r)
+
         wb.save(xlsx_path)
 
-    # /listavendas (últimas vendas)
-    @app_commands.command(name="listavendas", description="Mostra as últimas vendas registradas.")
+    @app_commands.command(name="listavendas", description="Mostra as últimas vendas de armas RP registradas.")
     @app_commands.describe(quantidade="Quantas linhas mostrar (1 a 30)")
     async def listavendas(self, interaction: discord.Interaction, quantidade: int = 10):
         if not self._check_perm(interaction):
-            return await interaction.response.send_message("❌ Você não tem permissão.", ephemeral=True)
+            return await interaction.response.send_message(
+                "❌ Você não tem permissão.",
+                ephemeral=True,
+            )
 
         quantidade = max(1, min(int(quantidade), 30))
-        rows = _read_last_rows(quantidade)
+        path = _csv_path()
 
-        if not rows:
-            return await interaction.response.send_message("⚠️ Ainda não tem vendas registradas.", ephemeral=True)
+        if not path.exists():
+            return await interaction.response.send_message(
+                "⚠️ Ainda não tem vendas registradas.",
+                ephemeral=True,
+            )
 
-        emb = discord.Embed(title=f"🧾 Últimas {len(rows)} vendas", color=discord.Color.gold())
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            rows = list(csv.DictReader(f))
+
+        ultimas = rows[-quantidade:]
+        if not ultimas:
+            return await interaction.response.send_message(
+                "⚠️ Nenhuma venda encontrada.",
+                ephemeral=True,
+            )
+
+        emb = discord.Embed(
+            title=f"🧾 Últimas {len(ultimas)} vendas de armas RP",
+            color=discord.Color.gold(),
+        )
+
         desc = []
-        for r in rows:
-            tipo = "Fam" if r.get("tipo") == "familia" else "Pista"
-            arma = r.get("arma", "-")
+        for r in ultimas:
+            item = r.get("item", "Item")
             qtd = r.get("quantidade", "0")
-            total = r.get("total", "0")
+            total_raw = r.get("total", "0")
             player = r.get("player", "-")
-            desc.append(f"`{tipo}` **{arma}** x{qtd} • Total {_money(int(total))} • `{player}`")
+
+            try:
+                total_formatado = _money(int(total_raw))
+            except ValueError:
+                total_formatado = total_raw
+
+            desc.append(f"🔫 **{item}** x{qtd} • Total {total_formatado} • Player `{player}`")
 
         emb.description = "\n".join(desc[:30])
         emb.set_footer(text="Use /exportvendas para baixar a planilha")
@@ -370,4 +404,4 @@ class VendasSystem(commands.Cog):
 
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(VendasSystem(bot), guild=discord.Object(id=int(config.GUILD_ID)) if getattr(config, "GUILD_ID", None) else None)
+    await bot.add_cog(VendasSystem(bot))
