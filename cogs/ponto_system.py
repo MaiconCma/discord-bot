@@ -50,7 +50,8 @@ def _tz() -> ZoneInfo:
     try:
         return ZoneInfo(PONTO_TIMEZONE)
     except Exception:
-        return ZoneInfo("America/Sao_Paulo")
+        # Fallback para UTC se o fuso não for encontrado
+        return ZoneInfo("UTC")
 
 
 def _now_utc() -> datetime:
