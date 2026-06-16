@@ -66,6 +66,7 @@ class Bot(commands.Bot):
             "cogs.music",
             "cogs.dev_info",
             "cogs.ponto_system",
+            "cogs.bolao_copa_system",
         ]
         for ext in extensions:
             try:
