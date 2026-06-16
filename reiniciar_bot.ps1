@@ -2,7 +2,7 @@
 # Reiniciar Discord Bot
 # =============================================
 
-$BOT_PATH = "C:\Users\secre\Documents\bot\discord-bot"
+$BOT_PATH = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
 Write-Host "Encerrando processos Python do Discord Bot..." -ForegroundColor Yellow
 

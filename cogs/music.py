@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
 import os
 import random
+import shutil
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -96,6 +99,18 @@ class Track:
         m, s = divmod(self.duration, 60)
         h, m = divmod(m, 60)
         return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+def _resolve_ffmpeg_path() -> str:
+    ffmpeg_path = getattr(config, "FFMPEG_PATH", "ffmpeg")
+    if os.path.isabs(ffmpeg_path) or os.path.exists(ffmpeg_path):
+        return ffmpeg_path
+    resolved = shutil.which(ffmpeg_path)
+    if resolved:
+        return resolved
+    raise FileNotFoundError(
+        f"FFmpeg não encontrado em '{ffmpeg_path}'. Instale o FFmpeg e adicione ao PATH, ou defina FFMPEG_PATH no .env."
+    )
+
 
 class GuildPlayer:
     def __init__(self, bot: commands.Bot, guild_id: int):
@@ -246,7 +261,7 @@ class GuildPlayer:
             log.warning("Tentativa de reprodução sem conexão de voz.")
             return
 
-        ffmpeg_path = getattr(config, "FFMPEG_PATH", "ffmpeg")
+        ffmpeg_path = _resolve_ffmpeg_path()
         volume_filter = f"volume={self.volume:.2f}" if self.volume != 1.0 else None
         options = FFMPEG_OPTS
         if volume_filter:
@@ -533,6 +548,12 @@ class Music(commands.Cog):
             return
 
         player = self._get_player(ctx.guild.id)
+        try:
+            _resolve_ffmpeg_path()
+        except FileNotFoundError as exc:
+            await msg.edit(content=f"❌ {exc}")
+            return
+
         player.start()
         player.text_channel = ctx.channel
 

@@ -74,14 +74,15 @@ class AsyncJsonStore:
                 suffix=".json",
                 dir=str(self.path.parent)
             )
+            os.close(fd)
 
             try:
                 # Escreve os dados no arquivo temporário
-                async with aiofiles.open(fd, "w", encoding="utf-8") as f:
+                async with aiofiles.open(tmp_path, "w", encoding="utf-8") as f:
                     await f.write(json.dumps(data, ensure_ascii=False, indent=2))
 
                 # Renomeia atomicamente (substitui o original)
-                await aiofiles.os.replace(tmp_path, self.path)
+                await aiofiles.os.replace(tmp_path, str(self.path))
 
             except Exception:
                 # Em caso de erro, tenta remover o temporário
