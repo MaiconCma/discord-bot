@@ -74,53 +74,155 @@ def anime_embed(anime: dict[str, Any], title_prefix: str = "📺") -> discord.Em
 
 
 class RecommendationView(discord.ui.View):
-    def __init__(self, cog: "AnimeReminderSystemV2", anime: dict[str, Any], guild_id: int, user_id: int | None):
+    """View de recomendação com proteção contra múltiplos cliques.
+
+    Melhorias:
+    - Apenas o usuário que executou /recomendar pode interagir.
+    - Seguir/Ignorar exigem permissão do sistema de anime.
+    - O primeiro clique bloqueia a view com asyncio.Lock.
+    - Depois do clique, todos os botões são desativados na mensagem.
+    - Usa a assinatura correta do AnimeRepository.add_anilist_anime.
+    """
+
+    def __init__(
+        self,
+        repo: AnimeRepository,
+        anime: dict[str, Any],
+        guild_id: int,
+        user_id: int,
+    ):
         super().__init__(timeout=180)
-        self.cog = cog
+        self.repo = repo
         self.anime = anime
         self.guild_id = guild_id
         self.user_id = user_id
+        self._used = False
+        self._lock = asyncio.Lock()
+
+    @property
+    def title(self) -> str:
+        return self.anime.get("title") or "Anime desconhecido"
+
+    def _disable_buttons(self) -> None:
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "❌ Apenas quem pediu essa recomendação pode usar estes botões.",
+                ephemeral=True,
+            )
+            return False
+
+        if self._used:
+            await interaction.response.send_message(
+                "⚠️ Esta recomendação já foi processada.",
+                ephemeral=True,
+            )
+            return False
+
+        return True
+
+    async def _mark_processed_and_edit(self, interaction: discord.Interaction) -> None:
+        self._disable_buttons()
+        await interaction.response.edit_message(view=self)
 
     @discord.ui.button(label="✅ Seguir", style=discord.ButtonStyle.success)
-    async def follow_button(self, interaction: discord.Interaction, _: discord.ui.Button):
+    async def seguir_button(self, interaction: discord.Interaction, _: discord.ui.Button):
         if not has_anime_permission(interaction):
-            return await interaction.response.send_message("❌ Sem permissão.", ephemeral=True)
+            return await interaction.response.send_message(
+                "❌ Você não tem permissão para seguir animes neste servidor.",
+                ephemeral=True,
+            )
 
-        dia = weekday_from_timestamp(self.anime.get("nextAiringAt"))
-        created, _ = await asyncio.to_thread(
-            self.cog.repo.add_anilist_anime,
-            self.guild_id,
-            self.anime,
-            dia,
-            interaction.user.id,
-        )
-        if created:
-            await interaction.response.send_message(
-                f"✅ **{self.anime['title']}** foi adicionado aos animes seguidos.",
-                ephemeral=True,
-            )
-        else:
-            await interaction.response.send_message(
-                f"ℹ️ **{self.anime['title']}** já estava cadastrado. Atualizei os dados externos.",
-                ephemeral=True,
-            )
+        async with self._lock:
+            if self._used:
+                return await interaction.response.send_message(
+                    "⚠️ Esta recomendação já foi processada.",
+                    ephemeral=True,
+                )
+
+            self._used = True
+
+            try:
+                dia = weekday_from_timestamp(self.anime.get("nextAiringAt"))
+                created, anime_id = await asyncio.to_thread(
+                    self.repo.add_anilist_anime,
+                    self.guild_id,
+                    self.anime,
+                    dia,
+                    interaction.user.id,
+                )
+
+                await self._mark_processed_and_edit(interaction)
+
+                if created:
+                    suffix = f" com ID **{anime_id}**" if anime_id else ""
+                    await interaction.followup.send(
+                        f"✅ **{self.title}** foi adicionado/atualizado na lista de animes seguidos{suffix}.",
+                        ephemeral=True,
+                    )
+                else:
+                    await interaction.followup.send(
+                        f"⚠️ Não consegui adicionar **{self.title}**. Ele pode já estar cadastrado ou houve erro no banco.",
+                        ephemeral=True,
+                    )
+
+            except Exception as exc:
+                self._used = False
+                await interaction.response.send_message(
+                    f"❌ Erro ao seguir anime: `{exc}`",
+                    ephemeral=True,
+                )
 
     @discord.ui.button(label="🚫 Ignorar", style=discord.ButtonStyle.danger)
-    async def ignore_button(self, interaction: discord.Interaction, _: discord.ui.Button):
+    async def ignorar_button(self, interaction: discord.Interaction, _: discord.ui.Button):
         if not has_anime_permission(interaction):
-            return await interaction.response.send_message("❌ Sem permissão.", ephemeral=True)
+            return await interaction.response.send_message(
+                "❌ Você não tem permissão para ignorar recomendações neste servidor.",
+                ephemeral=True,
+            )
 
-        await asyncio.to_thread(
-            self.cog.repo.ignore_anime,
-            self.guild_id,
-            int(self.anime["id"]),
-            self.anime["title"],
-            interaction.user.id,
-        )
-        await interaction.response.send_message(
-            f"🚫 **{self.anime['title']}** não será mais recomendado para este servidor.",
-            ephemeral=True,
-        )
+        async with self._lock:
+            if self._used:
+                return await interaction.response.send_message(
+                    "⚠️ Esta recomendação já foi processada.",
+                    ephemeral=True,
+                )
+
+            self._used = True
+
+            try:
+                external_id = self.anime.get("id")
+                if external_id is None:
+                    raise ValueError("Anime sem ID externo do AniList.")
+
+                await asyncio.to_thread(
+                    self.repo.ignore_anime,
+                    self.guild_id,
+                    int(external_id),
+                    self.title,
+                    interaction.user.id,
+                )
+
+                await self._mark_processed_and_edit(interaction)
+                await interaction.followup.send(
+                    f"🚫 **{self.title}** foi marcado como ignorado nas próximas recomendações.",
+                    ephemeral=True,
+                )
+
+            except Exception as exc:
+                self._used = False
+                await interaction.response.send_message(
+                    f"❌ Erro ao ignorar anime: `{exc}`",
+                    ephemeral=True,
+                )
+
+    async def on_timeout(self) -> None:
+        self._used = True
+        self._disable_buttons()
 
 
 class AnimeReminderView(discord.ui.View):
@@ -248,7 +350,6 @@ class AnimeReminderSystemV2(commands.Cog):
                 if not next_ep or not next_airing:
                     continue
 
-                # Alerta informativo do próximo episódio, sem repetir.
                 unique_key = f"anilist-next:{guild.id}:{external_id}:{next_ep}:{next_airing}"
                 created = await asyncio.to_thread(
                     self.repo.create_alert_if_not_exists,
@@ -436,7 +537,7 @@ class AnimeReminderSystemV2(commands.Cog):
             return await interaction.followup.send("📭 Não encontrei uma recomendação boa com esse filtro.", ephemeral=True)
 
         embed = anime_embed(anime, title_prefix="✨ Recomendação")
-        view = RecommendationView(self, anime, interaction.guild.id, interaction.user.id)
+        view = RecommendationView(self.repo, anime, interaction.guild.id, interaction.user.id)
         await interaction.followup.send(embed=embed, view=view)
 
     @app_commands.command(name="seguir", description="Busca um anime no AniList e adiciona aos seguidos")
@@ -464,16 +565,17 @@ class AnimeReminderSystemV2(commands.Cog):
 
         anime = results[0]
         dia = dia_semana.value if dia_semana else weekday_from_timestamp(anime.get("nextAiringAt"))
-        created, _ = await asyncio.to_thread(
+        created, anime_id = await asyncio.to_thread(
             self.repo.add_anilist_anime,
             interaction.guild.id,
             anime,
             dia,
             interaction.user.id,
         )
-        msg = "adicionado" if created else "atualizado"
+        msg = "adicionado/atualizado" if created else "não foi cadastrado"
+        id_msg = f" ID: **{anime_id}**." if anime_id else ""
         await interaction.followup.send(
-            f"✅ **{anime['title']}** foi {msg}. Dia de lembrete: **{dia or 'não definido'}**.",
+            f"✅ **{anime['title']}** foi {msg}. Dia de lembrete: **{dia or 'não definido'}**.{id_msg}",
             ephemeral=True,
         )
 
@@ -486,11 +588,21 @@ class AnimeReminderSystemV2(commands.Cog):
             return await interaction.response.send_message("❌ Este comando só funciona em servidores.", ephemeral=True)
 
         await interaction.response.defer(ephemeral=True)
-        results = await self.anilist.search_anime(nome, per_page=1)
+        try:
+            results = await self.anilist.search_anime(nome, per_page=1)
+        except AniListError as exc:
+            return await interaction.followup.send(f"❌ Erro ao consultar AniList: `{exc}`", ephemeral=True)
+
         if not results:
             return await interaction.followup.send("📭 Anime não encontrado no AniList.", ephemeral=True)
         anime = results[0]
-        await asyncio.to_thread(self.repo.ignore_anime, interaction.guild.id, int(anime["id"]), anime["title"], interaction.user.id)
+        await asyncio.to_thread(
+            self.repo.ignore_anime,
+            interaction.guild.id,
+            int(anime["id"]),
+            anime["title"],
+            interaction.user.id,
+        )
         await interaction.followup.send(f"🚫 **{anime['title']}** foi ignorado nas recomendações.", ephemeral=True)
 
     @app_commands.command(name="preferencia", description="Define peso de preferência de gênero para o servidor")
