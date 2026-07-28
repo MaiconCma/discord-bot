@@ -51,8 +51,20 @@ if lock_file is None:
 # ==================================================
 # ENCODING / LOGS
 # ==================================================
+# Tenta ajustar o encoding do stdout de forma compatível
+# com ambientes que não expõem `reconfigure()` (IDEs, pipes, etc.).
 try:
-    sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    else:
+        import io
+
+        try:
+            # Recria um wrapper de texto usando o buffer subjacente, quando disponível.
+            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", line_buffering=True)
+        except Exception:
+            # Alguns ambientes não expõem `.buffer` — ignora nesse caso.
+            pass
 except Exception:
     pass
 
@@ -107,6 +119,7 @@ class Bot(commands.Bot):
             "cogs.dev_info",
             "cogs.ponto_system",
             "cogs.bolao_copa_system",
+            "cogs.solicitacao_armas",
         ]
 
         for ext in extensions:
@@ -145,10 +158,21 @@ class Bot(commands.Bot):
                 pass
             return
 
-        logging.exception(
+        if isinstance(exception, commands.CommandOnCooldown):
+            try:
+                await context.send(
+                    f"⏳ Aguarde **{exception.retry_after:.0f}s** antes de usar "
+                    f"`!{context.command}` novamente."
+                )
+            except Exception:
+                pass
+            return
+
+        logging.error(
             "[CMD ERROR] %s -> %r",
             getattr(context.command, "qualified_name", "unknown"),
             exception,
+            exc_info=(type(exception), exception, exception.__traceback__),
         )
 
         try:
@@ -161,7 +185,11 @@ class Bot(commands.Bot):
         interaction: discord.Interaction,
         error: app_commands.AppCommandError,
     ):
-        logging.exception("[SLASH ERROR] %r", error)
+        logging.error(
+            "[SLASH ERROR] %r",
+            error,
+            exc_info=(type(error), error, error.__traceback__),
+        )
 
         if isinstance(error, app_commands.errors.CommandSignatureMismatch):
             msg = (
@@ -201,6 +229,28 @@ async def on_ready():
         logging.info("[OK] Bot online.")
 
 
+async def _edit_or_send_command_result(
+    ctx: commands.Context,
+    message: discord.Message,
+    content: str,
+) -> None:
+    """Edita a mensagem de progresso ou envia outra caso ela não exista mais."""
+    try:
+        await message.edit(content=content)
+    except discord.NotFound:
+        # A mensagem pode ter sido apagada manualmente, por AutoMod ou outro bot.
+        try:
+            await ctx.send(content)
+        except discord.HTTPException:
+            logging.exception("Não foi possível enviar o resultado do comando.")
+    except discord.HTTPException:
+        logging.exception("Não foi possível editar a mensagem de progresso.")
+        try:
+            await ctx.send(content)
+        except discord.HTTPException:
+            pass
+
+
 # ==================================================
 # COMANDO PREFIXO: !sync
 # ==================================================
@@ -209,6 +259,7 @@ async def on_ready():
     description="[ADMIN] Sincroniza comandos slash com o servidor atual",
 )
 @commands.has_permissions(administrator=True)
+@commands.cooldown(1, 120, commands.BucketType.guild)
 async def sync_cmds(ctx: commands.Context):
     if ctx.guild is None:
         return await ctx.send("❌ Use este comando dentro de um servidor.")
@@ -218,27 +269,43 @@ async def sync_cmds(ctx: commands.Context):
     try:
         guild_obj = discord.Object(id=ctx.guild.id)
 
-        # 1. Remove comandos antigos específicos deste servidor
+        # Limpa apenas a árvore LOCAL da guild. Não faz chamada ao Discord aqui.
         bot.tree.clear_commands(guild=guild_obj)
-        await bot.tree.sync(guild=guild_obj)
 
-        # 2. Copia comandos atuais carregados no código para o servidor
+        # Copia os comandos globais carregados pelos Cogs para esta guild.
         bot.tree.copy_global_to(guild=guild_obj)
 
-        # 3. Sincroniza comandos atuais no servidor
+        # Uma única chamada de sincronização reduz o risco de rate limit.
         synced = await bot.tree.sync(guild=guild_obj)
 
-        await msg.edit(
-            content=(
-                f"✅ Sincronização concluída!\n"
+        await _edit_or_send_command_result(
+            ctx,
+            msg,
+            (
+                "✅ Sincronização concluída!\n"
                 f"**{len(synced)}** comandos slash atualizados neste servidor.\n\n"
-                f"Se ainda aparecer comando duplicado, use `!limparslash`."
-            )
+                "Recarregue o Discord com `Ctrl + R` caso algum comando não apareça."
+            ),
         )
 
-    except Exception as e:
-        logging.exception("[SYNC ERROR] %r", e)
-        await msg.edit(content=f"❌ Erro ao sincronizar: `{e}`")
+    except discord.HTTPException as error:
+        logging.exception("[SYNC HTTP ERROR] %r", error)
+        await _edit_or_send_command_result(
+            ctx,
+            msg,
+            (
+                "❌ O Discord recusou temporariamente a sincronização. "
+                "Aguarde alguns minutos e tente apenas uma vez."
+            ),
+        )
+
+    except Exception as error:
+        logging.exception("[SYNC ERROR] %r", error)
+        await _edit_or_send_command_result(
+            ctx,
+            msg,
+            f"❌ Erro ao sincronizar: `{error}`",
+        )
 
 
 # ==================================================
@@ -249,6 +316,7 @@ async def sync_cmds(ctx: commands.Context):
     description="[ADMIN] Remove comandos slash globais e do servidor atual",
 )
 @commands.has_permissions(administrator=True)
+@commands.cooldown(1, 300, commands.BucketType.guild)
 async def limpar_slash(ctx: commands.Context):
     if ctx.guild is None:
         return await ctx.send("❌ Use este comando dentro de um servidor.")
@@ -267,20 +335,26 @@ async def limpar_slash(ctx: commands.Context):
         bot.tree.clear_commands(guild=None)
         await bot.tree.sync(guild=None)
 
-        await msg.edit(
-            content=(
+        await _edit_or_send_command_result(
+            ctx,
+            msg,
+            (
                 "✅ Comandos slash antigos removidos.\n\n"
                 "Agora faça exatamente nesta ordem:\n"
                 "1. Pare o bot com `CTRL + C`\n"
                 "2. Inicie novamente com `python main.py`\n"
-                "3. Digite `!sync` no Discord\n"
-                "4. Recarregue o Discord com `Ctrl + R` se ainda aparecer comando antigo"
-            )
+                "3. Digite `!sync` apenas uma vez\n"
+                "4. Recarregue o Discord com `Ctrl + R`"
+            ),
         )
 
     except Exception as e:
         logging.exception("[LIMPAR SLASH ERROR] %r", e)
-        await msg.edit(content=f"❌ Erro ao limpar comandos slash: `{e}`")
+        await _edit_or_send_command_result(
+            ctx,
+            msg,
+            f"❌ Erro ao limpar comandos slash: `{e}`",
+        )
 
 
 # ==================================================
