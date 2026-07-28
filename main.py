@@ -256,82 +256,93 @@ async def _edit_or_send_command_result(
 # ==================================================
 @bot.command(
     name="sync",
-    description="[ADMIN] Sincroniza comandos slash com o servidor atual",
+    description="[ADMIN] Sincroniza comandos slash. Use: !sync (global), !sync ~ (local), !sync * (copia global pro local), !sync ^ (limpa local)"
 )
 @commands.has_permissions(administrator=True)
-@commands.cooldown(1, 120, commands.BucketType.guild)
-async def sync_cmds(ctx: commands.Context):
+@commands.cooldown(1, 300, commands.BucketType.guild)  # 5 min de cooldown — o Discord limita ~2 syncs/10min por guild
+async def sync_cmds(
+    ctx: commands.Context, guilds: commands.Greedy[discord.Object], spec: str | None = None
+) -> None:
     if ctx.guild is None:
         return await ctx.send("❌ Use este comando dentro de um servidor.")
 
-    msg = await ctx.send("🔄 Sincronizando comandos slash neste servidor...")
+    msg = await ctx.send("🔄 Sincronizando comandos slash...")
 
     try:
-        guild_obj = discord.Object(id=ctx.guild.id)
+        if not guilds:
+            if spec == "~":
+                # Sync apenas neste servidor — instantâneo, ideal para testes
+                synced = await bot.tree.sync(guild=ctx.guild)
+            elif spec == "*":
+                # Copia globais para o servidor atual e sincroniza — ainda 1 chamada só
+                bot.tree.copy_global_to(guild=ctx.guild)
+                synced = await bot.tree.sync(guild=ctx.guild)
+            elif spec == "^":
+                # Limpa comandos presos neste servidor (resolve duplicidade)
+                bot.tree.clear_commands(guild=ctx.guild)
+                await bot.tree.sync(guild=ctx.guild)
+                synced = []
+            else:
+                # Sync global — pode levar até 1h para aparecer para todos os usuários
+                synced = await bot.tree.sync()
 
-        # Limpa apenas a árvore LOCAL da guild. Não faz chamada ao Discord aqui.
-        bot.tree.clear_commands(guild=guild_obj)
+            target = "globalmente" if spec is None else "neste servidor"
+            await _edit_or_send_command_result(
+                ctx, msg,
+                f"✅ Sincronização concluída!\n"
+                f"**{len(synced)}** comandos atualizados {target}.\n"
+                f"_(Dica: use `!sync ~` para testar comandos novos instantaneamente)_"
+            )
+            return
 
-        # Copia os comandos globais carregados pelos Cogs para esta guild.
-        bot.tree.copy_global_to(guild=guild_obj)
-
-        # Uma única chamada de sincronização reduz o risco de rate limit.
-        synced = await bot.tree.sync(guild=guild_obj)
+        ret = 0
+        for guild in guilds:
+            try:
+                await bot.tree.sync(guild=guild)
+            except discord.HTTPException:
+                pass
+            else:
+                ret += 1
 
         await _edit_or_send_command_result(
-            ctx,
-            msg,
-            (
-                "✅ Sincronização concluída!\n"
-                f"**{len(synced)}** comandos slash atualizados neste servidor.\n\n"
-                "Recarregue o Discord com `Ctrl + R` caso algum comando não apareça."
-            ),
+            ctx, msg, f"✅ Árvore de comandos sincronizada em {ret}/{len(guilds)} servidores."
         )
 
     except discord.HTTPException as error:
-        logging.exception("[SYNC HTTP ERROR] %r", error)
-        await _edit_or_send_command_result(
-            ctx,
-            msg,
-            (
-                "❌ O Discord recusou temporariamente a sincronização. "
-                "Aguarde alguns minutos e tente apenas uma vez."
-            ),
-        )
-
+        # Erro 429 = rate limit do Discord no endpoint de comandos
+        if error.status == 429:
+            wait = getattr(error, 'retry_after', 300)
+            await _edit_or_send_command_result(
+                ctx, msg,
+                f"⏳ **Rate limit do Discord (429).**\n"
+                f"O Discord limita sincronizações de comandos. Aguarde **{wait:.0f}s** e tente novamente.\n"
+                f"_Dica: evite usar `!sync` várias vezes seguidas. Prefira `!sync ~` para testar._"
+            )
+        else:
+            logging.exception("[SYNC HTTP ERROR] %r", error)
+            await _edit_or_send_command_result(
+                ctx, msg, f"❌ O Discord recusou a sincronização (HTTP {error.status}). Veja o `bot.log`."
+            )
     except Exception as error:
         logging.exception("[SYNC ERROR] %r", error)
-        await _edit_or_send_command_result(
-            ctx,
-            msg,
-            f"❌ Erro ao sincronizar: `{error}`",
-        )
-
+        await _edit_or_send_command_result(ctx, msg, f"❌ Erro ao sincronizar: `{error}`")
 
 # ==================================================
 # COMANDO PREFIXO: !limparslash
 # ==================================================
 @bot.command(
     name="limparslash",
-    description="[ADMIN] Remove comandos slash globais e do servidor atual",
+    description="[ADMIN] Remove comandos slash globais (use !sync ^ para limpar local)"
 )
 @commands.has_permissions(administrator=True)
-@commands.cooldown(1, 300, commands.BucketType.guild)
+@commands.cooldown(1, 600, commands.BucketType.guild)  # 10 min — essa operação consome 2 chamadas à API
 async def limpar_slash(ctx: commands.Context):
     if ctx.guild is None:
         return await ctx.send("❌ Use este comando dentro de um servidor.")
 
-    msg = await ctx.send("🧹 Limpando comandos slash antigos...")
+    msg = await ctx.send("🧹 Limpando comandos slash globais...")
 
     try:
-        guild_obj = discord.Object(id=ctx.guild.id)
-
-        # 1. Limpa comandos específicos deste servidor no Discord
-        bot.tree.clear_commands(guild=guild_obj)
-        await bot.tree.sync(guild=guild_obj)
-
-        # 2. Limpa comandos globais antigos no Discord
-        # Isso remove comandos antigos que causam duplicidade.
         bot.tree.clear_commands(guild=None)
         await bot.tree.sync(guild=None)
 
@@ -339,15 +350,21 @@ async def limpar_slash(ctx: commands.Context):
             ctx,
             msg,
             (
-                "✅ Comandos slash antigos removidos.\n\n"
-                "Agora faça exatamente nesta ordem:\n"
-                "1. Pare o bot com `CTRL + C`\n"
-                "2. Inicie novamente com `python main.py`\n"
-                "3. Digite `!sync` apenas uma vez\n"
-                "4. Recarregue o Discord com `Ctrl + R`"
+                "✅ Comandos slash globais removidos.\n\n"
+                "Agora use `!sync ~` para registrar os comandos novamente neste servidor\n"
+                "ou `!sync ^` para limpar comandos presos APENAS neste servidor."
             ),
         )
 
+    except discord.HTTPException as e:
+        if e.status == 429:
+            await _edit_or_send_command_result(
+                ctx, msg,
+                f"⏳ **Rate limit do Discord (429).** Aguarde alguns minutos e tente novamente."
+            )
+        else:
+            logging.exception("[LIMPAR SLASH ERROR] %r", e)
+            await _edit_or_send_command_result(ctx, msg, f"❌ Erro HTTP {e.status}: `{e}`")
     except Exception as e:
         logging.exception("[LIMPAR SLASH ERROR] %r", e)
         await _edit_or_send_command_result(
